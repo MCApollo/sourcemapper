@@ -1,13 +1,26 @@
 #!/bin/bash
 
+JOBLIMIT=${JOBLIMIT:-50};
+
+LINTER=$(which prettier);
+LINTER=${LINTER:+"${LINTER} --write"}
+
 # check if a url has been supplied
 if [ -z "$1" ]; then
   echo "Please supply a sourcemap URL"
   exit 1;
 fi
 
+function grab () {
+  let FILE = ${1};
+
+  cat ${FILE};
+}
+
 # store url with sourcemap filename
-URL=$1
+URL="$1"
+OUTPUTDIR="$2"
+
 # store url without sourcemap filename
 URLNOMAP=$(echo $URL | rev | cut -d '/' -f2- | rev)
 
@@ -31,53 +44,85 @@ if [ "$RESP" != '200' ]; then
 fi
 
 # pull contents of the file into $MAP
-MAP=$(curl -s "$URL");
+if [[ -z ${OUTPUTDIR+z} ]]; then
+  TMPFILE=$(mktemp);
+else
+  OUTPUTDIR="$(realpath ${OUTPUTDIR})";
+  mkdir -p ${OUTPUTDIR};
+
+  TMPFILE="${OUTPUTDIR}/index.js.map";
+fi
+
+curl -s "$URL" > ${TMPFILE};
+
+function MAP () {
+  cat ${TMPFILE};
+}
 
 # is it even valid json?
-echo "$MAP" | jq > /dev/null 2>&1
+MAP | jq > /dev/null 2>&1
 if [ $? != 0 -a $? != 2 ]; then
   echo "Map contains invalid JSON."
   exit 1;
 fi
 
 # Version?
-VER=$(echo $MAP | jq '.version' 2> /dev/null);
+VER=$(MAP | jq '.version' 2> /dev/null);
 if [ "$VER" != '3' ]; then
     echo "This tool has only been tested with version 3 of the sourcemap spec."
     echo "the requested sourcemap returned a version of: $VER. Trying anyway."
 fi
 
-echo "Map loaded: read $(echo $MAP | wc -c) bytes from $(echo $URL | rev | awk -F'/' '{print $1}' | rev)."
+echo "$VERSION";
+
+echo "Map loaded: read $(MAP | wc -c) bytes from $(echo $URL | rev | awk -F'/' '{print $1}' | rev)."
 
 # get the number of files, the directory structure, and the file contents
-LENGTH=$(echo $MAP | jq '.sources[]' 2> /dev/null | wc -l);
-CONTENTS=$(echo $MAP | jq '.sourcesContent' 2> /dev/null );
-SOURCES=$(echo $MAP | jq '.sources' 2> /dev/null );
+LENGTH=$(MAP | jq '.sources[]' 2> /dev/null | wc -l);
+CONTENTS=$(MAP | jq '.sourcesContent' 2> /dev/null );
+SOURCES=$(MAP | jq '.sources' 2> /dev/null );
 
 echo "$LENGTH files to be written."
 COUNTER=$LENGTH
 
+BASE=${OUTPUTDIR:-'./sourcemaps'};
 for ((i=0;i<=LENGTH;i++)); do
-  printf "$COUNTER files remaining."
-  # for each file: get the path without the filename, remove ../'s, remove quotes
-  P=$(echo $SOURCES | jq .[$i] | rev | cut -d '/' -f2- | rev | sed 's/\"//g');
-  # get the filename without the path
-  F=$(echo $SOURCES | jq .[$i] | rev | awk -F'/' '{print $1}' | rev | sed 's/\"//g');
+  function loop () {
+    # for each file: get the path without the filename, remove ../'s, remove quotes
+    P=$(echo $SOURCES | jq .[$i] | rev | cut -d '/' -f2- | rev | sed 's/\"//g');
+    # get the filename without the path
+    F=$(echo $SOURCES | jq .[$i] | rev | awk -F'/' '{print $1}' | rev | sed 's/\"//g');
 
-  # check for source in sourcesContent, otehrwise get directly from the URL.
-  DATA=$(echo $CONTENTS | jq .[$i])
-  if [ "$DATA" == 'null' ]; then
-    DATA=$(curl -s "$URLNOMAP/$P/$F")
+    # check for source in sourcesContent, otherwise get directly from the URL.
+    DATA=$(echo $CONTENTS | jq .[$i]);
+    if [ "$DATA" == 'null' ]; then
+      DATA=$(curl -s "$URLNOMAP/$P/$F");
+    fi;
+
+    DATA=$(echo $DATA | sed 's/\\"/"/g');
+
+    # create directories to match the paths in the map, eliminate ../'s
+    P=$(echo $P | sed 's/\.\.\///g');
+    mkdir -p "$BASE/$P";
+
+    # create the file at that location
+    echo -ne "$(echo $DATA | sed -e 's/%/%%/g' -e 's/^"//' -e 's/"$//' )\n" > "$BASE/$P/$F";
+    echo -ne "\rWriting: $BASE/$P/$F\n";
+  }
+
+  printf "\r$COUNTER files remaining.";
+  JOBS=$(jobs -p | wc -l);
+
+  if [[ JOBS -lt JOBLIMIT ]]; then
+    loop &
+  else
+    loop
   fi
 
-  # create directories to match the paths in the map, eliminate ../'s
-  BASE='./sourcemaps';
-  P=$(echo $P | sed 's/\.\.\///g' )
-  mkdir -p "$BASE/$P";
-
-  # create the file at that location
-  echo -ne "$(echo $DATA | sed 's/%/%%/g')\n" > "$BASE/$P/$F";
-  echo -ne "\rWriting: $BASE/$P/$F\n"
   ((COUNTER=COUNTER-1))
-
 done
+
+wait;
+[[ ! -z $LINTER ]] && ${LINTER} $(realpath ${BASE})
+
+exit 0;
